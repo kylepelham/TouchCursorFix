@@ -1,0 +1,7 @@
+# build artifacts
+*.exe
+*.res.o
+
+# local dev scratch (old iterations, diagnostic logs)
+dev/
+*.log
