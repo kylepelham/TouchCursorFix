@@ -10,8 +10,12 @@
 //     else. (Raw-input games like WoW mouselook bypass this hook entirely.)
 //   * Raw Input (HID digitizer, usage page 0x0D): tells us WHEN a touch is happening.
 //   * On a touch we look up the cursor position from just BEFORE the touch (ring
-//     buffer) and, once the touch settles, snap the cursor back there + restore the
-//     pre-touch foreground window.
+//     buffer) and, once the touch settles, restore the pre-touch foreground window
+//     and snap the cursor back there.
+//   * If a VM or game has the cursor grabbed (ClipCursor), SetCursorPos would just
+//     clamp to the clip edge - so focus is restored FIRST (grabbers release when
+//     they lose foreground), any leftover clip is cleared, and the snap retries
+//     briefly until it actually lands on the anchor's monitor.
 //   * A one-shot-ish timer runs only during a touch, then stops -> ~0% CPU at idle.
 //     (Plus a once-a-minute watchdog that re-installs the mouse hook if Windows
 //     ever silently drops it, e.g. after a heavy system stall.)
@@ -45,6 +49,7 @@
 #define PRE_MS      40      // anchor = cursor pos at least this long before touch start
 #define SUPPRESS_MS 400     // ignore foreground changes during/just after a touch
 #define REHOOK_MS   60000   // hook-health watchdog cadence
+#define SNAP_TRIES  50      // retry the snap up to 50 timer ticks (~500 ms) while a grab releases
 
 static const wchar_t* APP_NAME    = L"TouchCursorFix";
 static const wchar_t* RUN_KEY     = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -68,6 +73,7 @@ static volatile LONG  g_timerOn;
 static POINT          g_anchor;
 static BOOL           g_haveAnchor;
 static HWND           g_restoreFg;
+static int            g_snapTries;
 
 // --- foreground tracking (pre-touch window) ---
 static HWND            g_realForeground;
@@ -96,15 +102,17 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
 // and re-install it. (Touch- and SetCursorPos-moves also pass through a live hook,
 // so a live hook always keeps the newest entry current.)
 static void RehookIfDead() {
-    if (!g_enabled || !g_mouseHook) return;
+    if (!g_enabled) return;
     POINT cur;
     if (!GetCursorPos(&cur)) return;
     unsigned newest = (g_hidx - 1) & (HIST - 1);
-    if (cur.x == g_hp[newest].x && cur.y == g_hp[newest].y) return;   // hook is current
-    if ((LONG)(GetTickCount() - g_ht[newest]) < 5000) return;         // recorded recently
-    UnhookWindowsHookEx(g_mouseHook);
-    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, g_hInst, 0);
-    unsigned i = g_hidx++ & (HIST - 1);                               // reseed history
+    if (g_mouseHook) {
+        if (cur.x == g_hp[newest].x && cur.y == g_hp[newest].y) return;   // hook is current
+        if ((LONG)(GetTickCount() - g_ht[newest]) < 5000) return;         // recorded recently
+        UnhookWindowsHookEx(g_mouseHook);
+    }
+    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, g_hInst, 0);  // null -> retried next minute
+    unsigned i = g_hidx++ & (HIST - 1);                                   // reseed history
     g_hp[i] = cur; g_ht[i] = GetTickCount();
 }
 
@@ -144,6 +152,24 @@ static void RestoreForeground(HWND target) {
     BringWindowToTop(target);
     if (tgT && tgT != me) AttachThreadInput(me, tgT, FALSE);
     if (fgT && fgT != me) AttachThreadInput(me, fgT, FALSE);
+}
+
+// Snap the cursor to `a`, defeating a foreign cursor grab if needed. If another
+// app (VMware, a game) holds a ClipCursor rect that excludes the anchor, a plain
+// SetCursorPos would clamp to the clip edge and pin the cursor there - clear the
+// clip first, and report whether the cursor actually reached the anchor's monitor
+// (so the caller can retry while the grabber asynchronously lets go).
+static BOOL TrySnap(POINT a) {
+    RECT c;
+    if (GetClipCursor(&c) && !PtInRect(&c, a)) {
+        ClipCursor(nullptr);                                       // release foreign clip
+        if (GetClipCursor(&c) && !PtInRect(&c, a)) return FALSE;   // re-asserted / elevated owner
+    }
+    SetCursorPos(a.x, a.y);
+    POINT p;
+    if (!GetCursorPos(&p)) return TRUE;
+    return MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST) ==
+           MonitorFromPoint(a, MONITOR_DEFAULTTONEAREST);
 }
 
 // ---------------------------------------------------------------------------
@@ -197,13 +223,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
     case WM_INPUT: {
         // We only registered digitizer usages, so any WM_INPUT == touch/pen.
         if (g_enabled) {
-            DWORD now = GetTickCount();
-            if (now - g_lastTouchTick > SEQ_GAP_MS) {      // new touch sequence
-                g_haveAnchor = FindBefore(now - PRE_MS, &g_anchor);
+            // Use the message's queue timestamp, not the processing time: under
+            // load (VMs!) WM_INPUT delivery can lag behind the LL mouse hook, and
+            // an anchor computed "40 ms before NOW" would already contain the
+            // touch-induced cursor jump.
+            DWORD evt = (DWORD)GetMessageTime();
+            if (evt - g_lastTouchTick > SEQ_GAP_MS) {      // new touch sequence
+                g_haveAnchor = FindBefore(evt - PRE_MS, &g_anchor);
                 g_restoreFg  = g_realForeground;           // pre-touch window
             }
-            g_lastTouchTick = now;
-            g_suppressFgUntil = now + SUPPRESS_MS;
+            g_lastTouchTick = evt;
+            g_suppressFgUntil = GetTickCount() + SUPPRESS_MS;
             InterlockedExchange(&g_pending, 1);
             if (!g_timerOn) { SetTimer(g_hwnd, TIMER_ID, POLL_MS, nullptr); g_timerOn = 1; }
         }
@@ -214,12 +244,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         if (w == TIMER_REHOOK) { RehookIfDead(); return 0; }
         if (g_pending && (GetTickCount() - g_lastTouchTick) >= RESTORE_MS) {
             InterlockedExchange(&g_pending, 0);
-            if (g_haveAnchor) SetCursorPos(g_anchor.x, g_anchor.y);
+            // Focus FIRST: a VM/game that grabbed the cursor releases its grab
+            // (and its ClipCursor) once it loses the foreground.
             if (g_restoreFocus) RestoreForeground(g_restoreFg);
             g_restoreFg = nullptr;
+            g_snapTries = g_haveAnchor ? SNAP_TRIES : 0;
             g_suppressFgUntil = GetTickCount() + SUPPRESS_MS;
         }
-        if (!g_pending) { KillTimer(g_hwnd, TIMER_ID); g_timerOn = 0; }
+        if (g_snapTries > 0 && !g_pending) {
+            if (TrySnap(g_anchor)) g_snapTries = 0; else --g_snapTries;
+        }
+        if (!g_pending && g_snapTries <= 0) { KillTimer(g_hwnd, TIMER_ID); g_timerOn = 0; }
         return 0;
 
     case WM_TRAY:
@@ -240,7 +275,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
 
     case WM_COMMAND:
         switch (LOWORD(w)) {
-        case IDM_ENABLED: g_enabled = !g_enabled; InterlockedExchange(&g_pending, 0); break;
+        case IDM_ENABLED: g_enabled = !g_enabled; InterlockedExchange(&g_pending, 0); g_snapTries = 0; break;
         case IDM_FOCUS:   g_restoreFocus = !g_restoreFocus; break;
         case IDM_STARTUP: SetStartup(!StartupEnabled()); break;
         case IDM_EXIT:    DestroyWindow(hwnd); break;
