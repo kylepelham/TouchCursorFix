@@ -2,30 +2,43 @@
 //
 // Problem it solves: an HID-digitizer touchscreen drags/leaves the desktop mouse
 // cursor on the touch monitor and can steal keyboard focus. This keeps the cursor
-// on your real mouse's monitor and restores focus after a tap - with none of the
-// heavy per-event work that makes "Touch Mouse Tools" add latency / wall the cursor.
+// on your real mouse's monitors and restores focus after a tap - with none of the
+// heavy per-event work that makes similar tools add latency / wall the cursor.
 //
 // How it works:
-//   * WH_MOUSE_LL hook: ONLY records the cursor position into a ring buffer. Nothing
-//     else. (Raw-input games like WoW mouselook bypass this hook entirely.)
-//   * Raw Input (HID digitizer, usage page 0x0D): tells us WHEN a touch is happening.
-//   * On a touch we look up the cursor position from just BEFORE the touch (ring
-//     buffer) and, once the touch settles, restore the pre-touch foreground window
-//     and snap the cursor back there.
-//   * If a VM or game has the cursor grabbed (ClipCursor), SetCursorPos would just
-//     clamp to the clip edge - so focus is restored FIRST (grabbers release when
-//     they lose foreground), any leftover clip is cleared, and the snap retries
-//     briefly until it actually lands on the anchor's monitor.
-//   * A one-shot-ish timer runs only during a touch, then stops -> ~0% CPU at idle.
-//     (Plus a once-a-minute watchdog that re-installs the mouse hook if Windows
-//     ever silently drops it, e.g. after a heavy system stall.)
+//   * Windows reports which monitor belongs to the touch digitizer
+//     (GetPointerDevices). That monitor is "touch land"; everywhere else is
+//     "home". The WH_MOUSE_LL hook tracks the last cursor position at home.
+//   * Two independent touch triggers feed one state machine:
+//       - Raw Input from HID digitizer usages (reliable for most taps), and
+//       - the hook spotting a non-injected cursor TELEPORT onto the touch monitor.
+//         A mouse can't jump 400+ px in one event; only touch synthesis can. This
+//         catches taps whose raw input gets swallowed (observed: VMware windows).
+//   * Once the touch settles: restore the pre-touch foreground window FIRST
+//     (VMs/games release cursor grabs when they lose focus), clear any foreign
+//     ClipCursor, snap the cursor back to its last home position - retrying
+//     briefly, and re-restoring if a late synthesized move / VM warp yanks the
+//     cursor onto the touch monitor again (post-restore guard).
+//   * If you move the mouse onto the touch monitor YOURSELF (gradual movement,
+//     never a teleport), the tool stands down until you leave - touches then
+//     don't move your cursor at all.
+//   * ~0% CPU at idle: the poll timer exists only during a touch (+ a short
+//     guard); a once-a-minute watchdog re-installs the hook if Windows ever
+//     silently drops it. Raw-input games bypass the hook entirely.
 //
 // Build: windres TouchCursorFix.rc -O coff -o TouchCursorFix.res.o
 //        g++ -O2 -s -municode -mwindows main.cpp TouchCursorFix.res.o -o TouchCursorFix.exe -luser32 -lshell32 -ladvapi32
+//
+// Run with -log to write a diagnostic TouchCursorFix.log next to the exe.
 
 #define WIN32_LEAN_AND_MEAN
+#define WINVER       0x0A00
+#define _WIN32_WINNT 0x0A00
 #include <windows.h>
 #include <shellapi.h>
+#include <cstdio>
+#include <cstdarg>
+#include <cwchar>
 
 #ifndef RIDEV_PAGEONLY
 #define RIDEV_PAGEONLY 0x00000020
@@ -34,6 +47,7 @@
 #define IDI_APP     1           // icon resource id (TouchCursorFix.rc)
 
 #define WM_TRAY     (WM_APP + 1)
+#define WM_TELEPORT (WM_APP + 2)   // hook saw a touch-like cursor teleport
 #define ID_TRAY     1
 #define IDM_ENABLED 100
 #define IDM_FOCUS   101
@@ -44,15 +58,20 @@
 
 #define HIST        256     // cursor-position history (power of two)
 #define POLL_MS     10      // timer cadence while a touch is in progress
-#define RESTORE_MS  30      // snap back this long after the last touch report
+#define RESTORE_MS  30      // snap back this long after the last touch signal
 #define SEQ_GAP_MS  300     // gap (ms) that begins a new touch "sequence"
-#define PRE_MS      40      // anchor = cursor pos at least this long before touch start
+#define MAX_SEQ_MS  1500    // hard cap on how long one sequence can stay alive
 #define SUPPRESS_MS 400     // ignore foreground changes during/just after a touch
 #define REHOOK_MS   60000   // hook-health watchdog cadence
-#define SNAP_TRIES  50      // retry the snap up to 50 timer ticks (~500 ms) while a grab releases
+#define SNAP_WIN_MS 3000    // keep re-snapping this long: Windows pins the cursor to the
+                            // touch point until the synthesized click is fully delivered,
+                            // which takes SECONDS for slow targets (VMware)
+#define GUARD_MS    800     // undo late synthesized moves/VM warps this long after a restore
+#define TELEPORT_PX 400     // one-event non-injected jump >= this = touch, not a mouse
+#define SEAM_PX     16      // treat this margin around the touch monitor as touch land too
 
-static const wchar_t* APP_NAME    = L"TouchCursorFix";
-static const wchar_t* RUN_KEY     = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t* APP_NAME = L"TouchCursorFix";
+static const wchar_t* RUN_KEY  = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
 static HINSTANCE       g_hInst;
 static HWND            g_hwnd;
@@ -61,37 +80,162 @@ static HWINEVENTHOOK   g_winHook;
 static NOTIFYICONDATAW g_nid;
 static UINT            g_wmTaskbarCreated;
 
-// --- cursor history (written by the mouse hook, read at touch start) ---
+// --- cursor history (written by the mouse hook) ---
 static POINT             g_hp[HIST];
 static DWORD             g_ht[HIST];
 static volatile unsigned g_hidx;
 
+// --- touch monitors (from GetPointerDevices), stored as inflated RECTs so the
+// --- seam column can never be misclassified as "home" ---
+static RECT g_touchRects[8];
+static int  g_touchMonCount;
+static BOOL g_lastOnTouch;          // previous hook event was on touch land
+
+// --- "home" = last cursor position NOT on a touch monitor ---
+static POINT g_homePos;
+static DWORD g_homeTime;
+static BOOL  g_userOnTouch;         // user moved onto the touch monitor deliberately
+
 // --- touch state ---
 static volatile DWORD g_lastTouchTick;
+static DWORD          g_seqStart;
 static volatile LONG  g_pending;
 static volatile LONG  g_timerOn;
 static POINT          g_anchor;
 static BOOL           g_haveAnchor;
 static HWND           g_restoreFg;
-static int            g_snapTries;
+static DWORD          g_snapUntil;  // keep re-snapping until this tick (0 = idle)
+static BOOL           g_snapDone;   // current snap window already succeeded
+static BOOL           g_ungrabSent; // Ctrl+Alt already sent this window
+static DWORD          g_guardUntil;
+static volatile LONG  g_warped;     // injected event yanked the cursor onto touch land mid-guard
+static DWORD          g_tpTime;     // teleport trigger: event time
+static int            g_touchWalk;  // consecutive gradual mouse moves on touch land
+static volatile LONG  g_parked;     // foreign injected placement onto touch land (any time)
 
 // --- foreground tracking (pre-touch window) ---
 static HWND            g_realForeground;
-static volatile DWORD  g_suppressFgUntil;   // ignore foreground changes until this tick
+static volatile DWORD  g_suppressFgUntil;
 
 // --- settings ---
 static BOOL g_enabled      = TRUE;
 static BOOL g_restoreFocus = TRUE;
 
+// --- optional debug logging (run with -log) ---
+static FILE* g_logf;
+static void LogF(const char* fmt, ...) {
+    if (!g_logf) return;
+    fprintf(g_logf, "%10lu ", GetTickCount());
+    va_list ap; va_start(ap, fmt);
+    vfprintf(g_logf, fmt, ap);
+    va_end(ap);
+    fputc('\n', g_logf);
+    fflush(g_logf);
+}
+
 // ---------------------------------------------------------------------------
 
-// Mouse hook: the ONLY thing on the per-event path. Keep it trivial.
+// Which monitor(s) belong to integrated touch/pen digitizers. Rects (not
+// HMONITORs): handle-compares go stale on display changes and are ambiguous in
+// the seam column - a rect with a seam margin is unambiguous.
+static void RefreshTouchMonitors() {
+    int old = g_touchMonCount;
+    g_touchMonCount = 0;
+    UINT32 n = 0;
+    if (GetPointerDevices(&n, nullptr) && n) {
+        POINTER_DEVICE_INFO info[16];
+        if (n > 16) n = 16;
+        if (GetPointerDevices(&n, info)) {
+            for (UINT32 i = 0; i < n && g_touchMonCount < 8; ++i) {
+                if ((info[i].pointerDeviceType == POINTER_DEVICE_TYPE_TOUCH ||
+                     info[i].pointerDeviceType == POINTER_DEVICE_TYPE_INTEGRATED_PEN) &&
+                    info[i].monitor) {
+                    MONITORINFO mi = { sizeof(mi), {}, {}, 0 };
+                    if (GetMonitorInfoW(info[i].monitor, &mi)) {
+                        InflateRect(&mi.rcMonitor, SEAM_PX, SEAM_PX);
+                        g_touchRects[g_touchMonCount++] = mi.rcMonitor;
+                    }
+                }
+            }
+        }
+    }
+    if (g_touchMonCount != old) {
+        LogF("touch monitors: %d", g_touchMonCount);
+        for (int i = 0; i < g_touchMonCount; ++i)
+            LogF("  touch rect: (%ld,%ld)-(%ld,%ld) incl. %dpx margin",
+                 g_touchRects[i].left, g_touchRects[i].top,
+                 g_touchRects[i].right, g_touchRects[i].bottom, SEAM_PX);
+    }
+}
+
+static BOOL OnTouchMon(POINT pt) {
+    for (int i = 0; i < g_touchMonCount; ++i)
+        if (PtInRect(&g_touchRects[i], pt)) return TRUE;
+    return FALSE;
+}
+
+// ---------------------------------------------------------------------------
+
+// Mouse hook: records positions, tracks "home", and classifies events. All
+// decisions here are a handful of compares; real work happens on the timer.
 static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION && g_enabled) {
         const MSLLHOOKSTRUCT* m = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
+        unsigned prevI = (g_hidx - 1) & (HIST - 1);
+        POINT prev  = g_hp[prevI];
+        DWORD prevT = g_ht[prevI];
         unsigned i = g_hidx++ & (HIST - 1);
         g_hp[i] = m->pt;
         g_ht[i] = m->time;          // event timestamp, no syscall
+
+        BOOL injected   = (m->flags & LLMHF_INJECTED) != 0;
+        BOOL onTouch    = OnTouchMon(m->pt);
+        BOOL wasOnTouch = g_lastOnTouch;
+        g_lastOnTouch   = onTouch;
+
+        LONG dx = m->pt.x - prev.x, dy = m->pt.y - prev.y;
+        LONG d2 = dx * dx + dy * dy;
+        // A mouse moves a few px per event; only synthesis teleports.
+        BOOL jump = !injected && prevT &&
+                    (d2 >= TELEPORT_PX * TELEPORT_PX ||
+                     (onTouch && !wasOnTouch && d2 >= 100 * 100));
+
+        if (!onTouch) {
+            // Home must be a REAL on-screen position: the LL hook can report
+            // unclamped coords (x=-1 while pushing against a boundary), and the
+            // desktop has dead zones next to a small touch monitor (XENEON Edge
+            // is 2560x720 in a 1440-tall desktop). Teleports are never home.
+            if (!jump && MonitorFromPoint(m->pt, MONITOR_DEFAULTTONULL)) {
+                g_homePos = m->pt; g_homeTime = m->time;
+            }
+            g_userOnTouch = FALSE;
+            g_touchWalk   = 0;
+        } else if (jump) {
+            // Touch trigger #2: synthesized tap-move landed on the touch monitor.
+            // Works even when the tap's raw input is swallowed (VMware windows).
+            g_touchWalk = 0;
+            g_tpTime    = m->time;
+            PostMessageW(g_hwnd, WM_TELEPORT, 0, 0);
+        } else if (!injected) {
+            if (g_pending) {
+                if ((LONG)(m->time - g_seqStart) < MAX_SEQ_MS && d2 > 0)
+                    g_lastTouchTick = m->time;       // finger drag keeps the sequence alive
+            } else if (d2 > 0 && ++g_touchWalk >= 6) {
+                g_userOnTouch = TRUE;                // sustained motion: user walked here
+            }
+        } else if (!g_userOnTouch && !g_pending) {
+            // Injected event ON the touch monitor (VM warp / foreign SetCursorPos).
+            // A programmatic placement of the cursor onto touch land is NEVER
+            // legitimate unless the user walked there - whenever it happens.
+            if ((LONG)(m->time - g_guardUntil) < 0) {
+                InterlockedExchange(&g_warped, 1);       // fresh: guard re-restores focus too
+            } else if (!g_snapUntil) {
+                // Late park, after all our windows closed (VMware can take many
+                // seconds to finish digesting a tap): reopen a snap window.
+                InterlockedExchange(&g_parked, 1);
+                if (!g_timerOn) { SetTimer(g_hwnd, TIMER_ID, POLL_MS, nullptr); g_timerOn = 1; }
+            }
+        }
     }
     return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
 }
@@ -99,8 +243,7 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
 // Windows silently removes a LL hook whose callback ever blows the hook timeout
 // (heavy stall, debugger, ...). Once a minute: if the cursor sits somewhere the
 // ring buffer never saw AND nothing was recorded for 5s+, assume the hook is dead
-// and re-install it. (Touch- and SetCursorPos-moves also pass through a live hook,
-// so a live hook always keeps the newest entry current.)
+// and re-install it.
 static void RehookIfDead() {
     if (!g_enabled) return;
     POINT cur;
@@ -112,21 +255,29 @@ static void RehookIfDead() {
         UnhookWindowsHookEx(g_mouseHook);
     }
     g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, g_hInst, 0);  // null -> retried next minute
+    LogF("REHOOK -> %p", (void*)g_mouseHook);
     unsigned i = g_hidx++ & (HIST - 1);                                   // reseed history
     g_hp[i] = cur; g_ht[i] = GetTickCount();
 }
 
-// Most recent recorded position with timestamp <= t (signed tick deltas, so the
-// comparison survives the 49.7-day GetTickCount wrap on a long-running session).
-static BOOL FindBefore(DWORD t, POINT* out) {
-    LONG bestAge = MAXLONG; BOOL found = FALSE;
-    for (unsigned i = 0; i < HIST; ++i) {
-        DWORD ts = g_ht[i];
-        if (!ts) continue;
-        LONG age = (LONG)(t - ts);
-        if (age >= 0 && age <= bestAge) { bestAge = age; *out = g_hp[i]; found = TRUE; }
+// Common touch bookkeeping for both triggers (raw input + teleport fallback).
+static void TouchSeen(DWORD evt, const char* src) {
+    if (evt - g_lastTouchTick > SEQ_GAP_MS) {              // new touch sequence
+        if (g_userOnTouch || OnTouchMon(g_homePos)) {
+            LogF("SEQ skip (%s): user on touch monitor / no valid home", src);
+            return;                                        // don't yank a cursor that lives there
+        }
+        g_anchor     = g_homePos;                          // last real off-touch position
+        g_haveAnchor = TRUE;
+        g_restoreFg  = g_realForeground;                   // pre-touch window
+        g_seqStart   = evt;
+        LogF("SEQ start (%s) anchor=(%ld,%ld) lag=%ldms fg=%p", src,
+             g_anchor.x, g_anchor.y, (LONG)(GetTickCount() - evt), (void*)g_restoreFg);
     }
-    return found;
+    g_lastTouchTick = evt;
+    g_suppressFgUntil = GetTickCount() + SUPPRESS_MS;
+    InterlockedExchange(&g_pending, 1);
+    if (!g_timerOn) { SetTimer(g_hwnd, TIMER_ID, POLL_MS, nullptr); g_timerOn = 1; }
 }
 
 // Track the foreground window, ignoring the change the touch itself causes.
@@ -159,17 +310,62 @@ static void RestoreForeground(HWND target) {
 // SetCursorPos would clamp to the clip edge and pin the cursor there - clear the
 // clip first, and report whether the cursor actually reached the anchor's monitor
 // (so the caller can retry while the grabber asynchronously lets go).
-static BOOL TrySnap(POINT a) {
+// Move the cursor via a REAL injected mouse event. Unlike SetCursorPos (a bare
+// position poke that the pointer stack overrides while a touch interaction is
+// unresolved), SendInput goes through the input pipeline and switches the active
+// pointing device back to the mouse - breaking the touch pin.
+static void InjectMove(POINT a) {
+    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN), vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (vw <= 0 || vh <= 0) return;
+    INPUT in = {};
+    in.type = INPUT_MOUSE;
+    in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+    in.mi.dx = MulDiv(a.x - vx, 65535, vw - 1);
+    in.mi.dy = MulDiv(a.y - vy, 65535, vh - 1);
+    SendInput(1, &in, sizeof(in));
+}
+
+static int TrySnap(POINT a) {       // 1 = ok, 0 = overridden/pinned, -1 = clip blocked
     RECT c;
     if (GetClipCursor(&c) && !PtInRect(&c, a)) {
-        ClipCursor(nullptr);                                       // release foreign clip
-        if (GetClipCursor(&c) && !PtInRect(&c, a)) return FALSE;   // re-asserted / elevated owner
+        ClipCursor(nullptr);                                   // release foreign clip
+        if (GetClipCursor(&c) && !PtInRect(&c, a)) return -1;  // re-asserted / elevated owner
     }
     SetCursorPos(a.x, a.y);
     POINT p;
-    if (!GetCursorPos(&p)) return TRUE;
-    return MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST) ==
-           MonitorFromPoint(a, MONITOR_DEFAULTTONEAREST);
+    if (!GetCursorPos(&p)) return 1;
+    if (!OnTouchMon(p)) return 1;   // mission accomplished = cursor is off touch land
+    InjectMove(a);                  // position poke was overridden: use real input
+    if (!GetCursorPos(&p)) return 1;
+    return OnTouchMon(p) ? 0 : 1;
+}
+
+// Is the foreground window owned by the given exe (basename, case-insensitive)?
+static BOOL FgIsExe(const wchar_t* name) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+    if (!pid) return FALSE;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return FALSE;
+    wchar_t exe[MAX_PATH]; DWORD n = MAX_PATH;
+    BOOL ok = QueryFullProcessImageNameW(h, 0, exe, &n);
+    CloseHandle(h);
+    if (!ok) return FALSE;
+    const wchar_t* base = exe;
+    for (const wchar_t* s = exe; *s; ++s) if (*s == L'\\') base = s + 1;
+    return lstrcmpiW(base, name) == 0;
+}
+
+// VMware's hard mouse grab (VM without Tools) re-asserts its ClipCursor faster
+// than we can clear it - but Ctrl+Alt is VMware's own designed ungrab hotkey.
+static void SendCtrlAlt() {
+    INPUT in[4] = {};
+    in[0].type = INPUT_KEYBOARD; in[0].ki.wVk = VK_CONTROL;
+    in[1].type = INPUT_KEYBOARD; in[1].ki.wVk = VK_MENU;
+    in[2].type = INPUT_KEYBOARD; in[2].ki.wVk = VK_MENU;    in[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    in[3].type = INPUT_KEYBOARD; in[3].ki.wVk = VK_CONTROL; in[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(4, in, sizeof(INPUT));
 }
 
 // ---------------------------------------------------------------------------
@@ -220,41 +416,89 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
     if (msg == g_wmTaskbarCreated) { TrayAdd(); return 0; }
 
     switch (msg) {
-    case WM_INPUT: {
-        // We only registered digitizer usages, so any WM_INPUT == touch/pen.
-        if (g_enabled) {
-            // Use the message's queue timestamp, not the processing time: under
-            // load (VMs!) WM_INPUT delivery can lag behind the LL mouse hook, and
-            // an anchor computed "40 ms before NOW" would already contain the
-            // touch-induced cursor jump.
-            DWORD evt = (DWORD)GetMessageTime();
-            if (evt - g_lastTouchTick > SEQ_GAP_MS) {      // new touch sequence
-                g_haveAnchor = FindBefore(evt - PRE_MS, &g_anchor);
-                g_restoreFg  = g_realForeground;           // pre-touch window
-            }
-            g_lastTouchTick = evt;
-            g_suppressFgUntil = GetTickCount() + SUPPRESS_MS;
-            InterlockedExchange(&g_pending, 1);
-            if (!g_timerOn) { SetTimer(g_hwnd, TIMER_ID, POLL_MS, nullptr); g_timerOn = 1; }
-        }
+    case WM_INPUT:
+        // Touch trigger #1: we only registered digitizer usages, so any
+        // WM_INPUT == touch/pen. GetMessageTime = queue timestamp (immune to
+        // delivery lag under load).
+        if (g_enabled) TouchSeen((DWORD)GetMessageTime(), "rawinput");
         return DefWindowProcW(hwnd, msg, w, l);            // raw-input cleanup
-    }
+
+    case WM_TELEPORT:
+        if (g_enabled) TouchSeen(g_tpTime, "teleport");
+        return 0;
 
     case WM_TIMER:
-        if (w == TIMER_REHOOK) { RehookIfDead(); return 0; }
+        if (w == TIMER_REHOOK) { RehookIfDead(); RefreshTouchMonitors(); return 0; }
         if (g_pending && (GetTickCount() - g_lastTouchTick) >= RESTORE_MS) {
             InterlockedExchange(&g_pending, 0);
             // Focus FIRST: a VM/game that grabbed the cursor releases its grab
             // (and its ClipCursor) once it loses the foreground.
             if (g_restoreFocus) RestoreForeground(g_restoreFg);
-            g_restoreFg = nullptr;
-            g_snapTries = g_haveAnchor ? SNAP_TRIES : 0;
+            g_snapUntil  = g_haveAnchor ? GetTickCount() + SNAP_WIN_MS : 0;
+            g_snapDone   = !g_haveAnchor;
+            g_ungrabSent = FALSE;
+            g_guardUntil = GetTickCount() + GUARD_MS;
+            InterlockedExchange(&g_warped, 0);
             g_suppressFgUntil = GetTickCount() + SUPPRESS_MS;
+            LogF("RESTORE anchor=(%ld,%ld) fg=%p", g_anchor.x, g_anchor.y, (void*)g_restoreFg);
         }
-        if (g_snapTries > 0 && !g_pending) {
-            if (TrySnap(g_anchor)) g_snapTries = 0; else --g_snapTries;
+        if (!g_pending) {
+            if (g_parked) {
+                InterlockedExchange(&g_parked, 0);
+                if (!g_userOnTouch && !OnTouchMon(g_homePos)) {
+                    g_anchor = g_homePos; g_haveAnchor = TRUE;
+                    g_snapUntil  = GetTickCount() + SNAP_WIN_MS;
+                    g_snapDone   = FALSE;
+                    g_ungrabSent = FALSE;
+                    LogF("PARK detected -> snap window reopened anchor=(%ld,%ld)",
+                         g_anchor.x, g_anchor.y);
+                }
+            }
+            if (g_snapUntil && g_userOnTouch) {            // user took over - stand down
+                LogF("SNAP canceled (user moving on touch land)");
+                g_snapUntil = 0;
+            }
+            if (g_snapUntil) {
+                if ((LONG)(GetTickCount() - g_snapUntil) >= 0) {
+                    if (!g_snapDone) LogF("SNAP window expired (cursor still held)");
+                    g_snapUntil = 0;
+                } else {
+                    // Windows pins the cursor to the touch point until the tap's
+                    // synthesized click is fully delivered (seconds, for slow
+                    // targets like VMware). Poll: whenever the cursor sits on
+                    // touch land, snap it home again - until it finally sticks.
+                    POINT p;
+                    if (GetCursorPos(&p) && !OnTouchMon(p)) {
+                        if (!g_snapDone) { LogF("SNAP ok"); g_snapDone = TRUE; }
+                    } else {
+                        if (g_snapDone) { LogF("SNAP re-engaged (cursor pulled back)"); g_snapDone = FALSE; }
+                        int r = TrySnap(g_anchor);
+                        if (r == 1) { LogF("SNAP ok"); g_snapDone = TRUE; }
+                        else if (r == -1 && !g_ungrabSent && FgIsExe(L"vmware.exe")) {
+                            LogF("SNAP clip-blocked by VMware grab -> sending Ctrl+Alt ungrab");
+                            SendCtrlAlt();
+                            g_ungrabSent = TRUE;
+                        }
+                    }
+                }
+            }
+            if (g_warped) {
+                // A VM warp / foreign injected move yanked the cursor onto the
+                // touch monitor right after our restore: put focus back too.
+                InterlockedExchange(&g_warped, 0);
+                LogF("GUARD re-restore");
+                if (g_restoreFocus) RestoreForeground(g_restoreFg);
+                g_suppressFgUntil = GetTickCount() + SUPPRESS_MS;
+            }
+            if (!g_snapUntil && (LONG)(GetTickCount() - g_guardUntil) >= 0) {
+                g_restoreFg = nullptr;                     // all windows over - back to sleep
+                KillTimer(g_hwnd, TIMER_ID); g_timerOn = 0;
+            }
         }
-        if (!g_pending && g_snapTries <= 0) { KillTimer(g_hwnd, TIMER_ID); g_timerOn = 0; }
+        return 0;
+
+    case WM_DISPLAYCHANGE:
+        RefreshTouchMonitors();
         return 0;
 
     case WM_TRAY:
@@ -275,7 +519,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
 
     case WM_COMMAND:
         switch (LOWORD(w)) {
-        case IDM_ENABLED: g_enabled = !g_enabled; InterlockedExchange(&g_pending, 0); g_snapTries = 0; break;
+        case IDM_ENABLED: g_enabled = !g_enabled; InterlockedExchange(&g_pending, 0);
+                          g_snapUntil = 0; g_guardUntil = 0;
+                          InterlockedExchange(&g_warped, 0); break;
         case IDM_FOCUS:   g_restoreFocus = !g_restoreFocus; break;
         case IDM_STARTUP: SetStartup(!StartupEnabled()); break;
         case IDM_EXIT:    DestroyWindow(hwnd); break;
@@ -292,11 +538,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
     return DefWindowProcW(hwnd, msg, w, l);
 }
 
-int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmd, int) {
     g_hInst = hInst;
 
     HANDLE mtx = CreateMutexW(nullptr, TRUE, L"TouchCursorFix_singleton_v1");
     if (mtx && GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+
+    // Debug logging: run with -log to write TouchCursorFix.log next to the exe.
+    if (cmd && wcsstr(cmd, L"-log")) {
+        wchar_t p[MAX_PATH];
+        GetModuleFileNameW(nullptr, p, MAX_PATH);
+        wchar_t* s = wcsrchr(p, L'\\');
+        lstrcpyW(s ? s + 1 : p, L"TouchCursorFix.log");
+        g_logf = _wfopen(p, L"w");
+        LogF("start (v1.2.5)");
+    }
 
     // Per-Monitor-V2 DPI awareness: the LL-hook coords and SetCursorPos then share
     // one physical-pixel space on mixed-DPI monitor setups (no-op before Win10 1703).
@@ -306,8 +562,22 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     if (setDpiCtx) setDpiCtx((HANDLE)-4 /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 */);
     else SetProcessDPIAware();
 
-    // seed history + foreground with current state
-    { POINT p; GetCursorPos(&p); g_hp[0] = p; g_ht[0] = GetTickCount(); g_hidx = 1; }
+    RefreshTouchMonitors();
+
+    // seed history + home + foreground with current state
+    {
+        POINT p; GetCursorPos(&p);
+        g_hp[0] = p; g_ht[0] = GetTickCount(); g_hidx = 1;
+        g_lastOnTouch = OnTouchMon(p);
+        g_userOnTouch = g_lastOnTouch;
+        if (g_lastOnTouch) {   // started with cursor on touch land: home = primary center
+            g_homePos.x = GetSystemMetrics(SM_CXSCREEN) / 2;
+            g_homePos.y = GetSystemMetrics(SM_CYSCREEN) / 2;
+        } else {
+            g_homePos = p;
+        }
+        g_homeTime = GetTickCount();
+    }
     g_realForeground = GetForegroundWindow();
     g_wmTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
@@ -324,8 +594,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     TrayAdd();
 
     // Raw input, as an input sink: touch screens (0x0D/0x04), pens (0x02) and pen
-    // digitizers (0x01) - but NOT precision touchpads (0x05), which the old
-    // page-wide registration also captured (it would fight the touchpad on laptops).
+    // digitizers (0x01) - but NOT precision touchpads (0x05).
     RAWINPUTDEVICE rids[3] = {};
     static const USHORT usages[3] = { 0x04, 0x02, 0x01 };
     for (int i = 0; i < 3; ++i) {
@@ -343,7 +612,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         rid.hwndTarget  = g_hwnd;
         if (!RegisterRawInputDevices(&rid, 1, sizeof(rid)))
             MessageBoxW(nullptr, L"Could not register for touch (raw input) events.\n"
-                                 L"Touch detection will not work.", APP_NAME, MB_ICONWARNING);
+                                 L"Touch detection will rely on teleport detection only.",
+                        APP_NAME, MB_ICONWARNING);
     }
 
     g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, hInst, 0);

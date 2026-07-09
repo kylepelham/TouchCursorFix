@@ -44,22 +44,29 @@ Right-click the tray icon:
 
 ## How it works
 
-1. A `WH_MOUSE_LL` hook records cursor positions into a ring buffer — that's *all* it does
-2. Raw Input (HID digitizer) signals that a touch is happening
-3. The cursor position from just *before* the touch is looked up in the buffer
-4. 30 ms after the last touch report: cursor snaps back, focus is restored
+1. Windows reports which monitor belongs to the touch digitizer (`GetPointerDevices`) — that's *touch land*; everywhere else is *home*
+2. A `WH_MOUSE_LL` hook records cursor positions and tracks your last *home* position
+3. Touches are detected two independent ways: raw digitizer input, **and** the hook spotting a physically-impossible cursor teleport onto the touch monitor (catches taps whose raw input gets swallowed by the target window)
+4. Once the touch settles: the pre-touch window gets focus back first (VMs/games release cursor grabs when they lose it), then the cursor snaps home — retrying until it sticks
+5. Walk the mouse onto the touch monitor yourself and the tool **stands down** until you leave — touches then won't move your cursor at all
 
 <details>
 <summary><b>Implementation notes</b> (for the curious)</summary>
 <br>
 
 - Registers digitizer usages `0x0D/0x04` (touch screen), `0x02` (pen), `0x01` (pen digitizer) — deliberately **not** `0x05` (precision touchpads). Falls back to the whole `0x0D` page for exotic devices.
+- *Home* is the last **real on-screen** cursor position off touch land — unclamped hook coordinates, monitor-seam pixels, and desktop dead zones (small touch monitors like a 2560x720 touch bar leave one) can never poison it. The seam gets a 16 px margin.
+- A teleport = a non-injected single-event jump of 400+ px (or 100+ px crossing onto touch land). Real mice move a few px per event; only touch synthesis teleports.
+- Foreign `ClipCursor` grabs are cleared before snapping; VMware's hard mouse grab (VM without Tools) is broken with VMware's own Ctrl+Alt ungrab hotkey — only when `vmware.exe` is the foreground process.
+- Snaps escalate from `SetCursorPos` to real injected mouse input (`SendInput`) when the pointer stack overrides the position poke, and keep retrying for up to 3 s. Programmatic cursor placements onto touch land re-open the corrective window whenever they happen.
 - Focus restore uses the `AttachThreadInput` technique — no global system settings are touched.
-- The 10 ms poll timer exists only during a touch. A once-a-minute watchdog re-installs the hook if Windows ever silently drops it (which happens to hooks that blow the hook timeout during a system stall).
-- Per-Monitor-V2 DPI aware, so hook coordinates and `SetCursorPos` agree on mixed-DPI monitor layouts.
-- Tick math survives the 49.7-day `GetTickCount` wrap. Single instance via named mutex.
+- The 10 ms poll timer exists only around a touch. A once-a-minute watchdog re-installs the hook if Windows ever silently drops it.
+- Per-Monitor-V2 DPI aware, tick math survives the 49.7-day `GetTickCount` wrap, single instance via named mutex.
+- Run with **`-log`** to write a diagnostic `TouchCursorFix.log` next to the exe.
 
 </details>
+
+> **Known limitation:** taps landing on a VMware Workstation window can leave the cursor stranded on the touch monitor. Windows pins the cursor to the touch point while the tap's synthesized click waits on VMware's message queue, and VMware re-parks the cursor after processing; the app fights back (and usually wins within ~1 s), but some VMware states hold the cursor indefinitely. Every other target tested behaves.
 
 ## Building
 
