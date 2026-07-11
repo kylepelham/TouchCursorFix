@@ -109,9 +109,9 @@ static BOOL           g_snapDone;   // current snap window already succeeded
 static BOOL           g_ungrabSent; // Ctrl+Alt already sent this window
 static DWORD          g_guardUntil;
 static volatile LONG  g_warped;     // injected event yanked the cursor onto touch land mid-guard
-static DWORD          g_tpTime;     // teleport trigger: event time
-static int            g_touchWalk;  // consecutive gradual mouse moves on touch land
-static volatile LONG  g_parked;     // foreign injected placement onto touch land (any time)
+static DWORD          g_tpTime;       // teleport trigger: event time
+static volatile LONG  g_parked;       // foreign injected placement onto touch land (any time)
+static volatile DWORD g_mouseRawTick; // last RELATIVE mouse raw input = user's hand on the mouse
 
 // --- foreground tracking (pre-touch window) ---
 static HWND            g_realForeground;
@@ -192,11 +192,15 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
         BOOL onTouch    = OnTouchMon(m->pt);
         BOOL wasOnTouch = g_lastOnTouch;
         g_lastOnTouch   = onTouch;
+        // Ground truth: RELATIVE mouse raw input within the last 60 ms means the
+        // user's hand is on the mouse. Touch synthesis and programmatic warps
+        // never produce relative mouse raw input, so this cannot be faked.
+        BOOL mouseDriven = (LONG)(m->time - g_mouseRawTick) < 60;
 
         LONG dx = m->pt.x - prev.x, dy = m->pt.y - prev.y;
         LONG d2 = dx * dx + dy * dy;
-        // A mouse moves a few px per event; only synthesis teleports.
-        BOOL jump = !injected && prevT &&
+        // Only synthesis teleports; a mouse being driven is just moving fast.
+        BOOL jump = !injected && !mouseDriven && prevT &&
                     (d2 >= TELEPORT_PX * TELEPORT_PX ||
                      (onTouch && !wasOnTouch && d2 >= 100 * 100));
 
@@ -209,20 +213,19 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 g_homePos = m->pt; g_homeTime = m->time;
             }
             g_userOnTouch = FALSE;
-            g_touchWalk   = 0;
+        } else if (mouseDriven && !injected && d2 > 0) {
+            // The physical mouse is moving on touch land: the user came here on
+            // purpose. Stand down instantly and abort anything in flight.
+            g_userOnTouch = TRUE;
+            InterlockedExchange(&g_pending, 0);
         } else if (jump) {
             // Touch trigger #2: synthesized tap-move landed on the touch monitor.
             // Works even when the tap's raw input is swallowed (VMware windows).
-            g_touchWalk = 0;
-            g_tpTime    = m->time;
+            g_tpTime = m->time;
             PostMessageW(g_hwnd, WM_TELEPORT, 0, 0);
         } else if (!injected) {
-            if (g_pending) {
-                if ((LONG)(m->time - g_seqStart) < MAX_SEQ_MS && d2 > 0)
-                    g_lastTouchTick = m->time;       // finger drag keeps the sequence alive
-            } else if (d2 > 0 && ++g_touchWalk >= 6) {
-                g_userOnTouch = TRUE;                // sustained motion: user walked here
-            }
+            if (g_pending && (LONG)(m->time - g_seqStart) < MAX_SEQ_MS && d2 > 0)
+                g_lastTouchTick = m->time;           // finger drag keeps the sequence alive
         } else if (!g_userOnTouch && !g_pending) {
             // Injected event ON the touch monitor (VM warp / foreign SetCursorPos).
             // A programmatic placement of the cursor onto touch land is NEVER
@@ -262,10 +265,11 @@ static void RehookIfDead() {
 
 // Common touch bookkeeping for both triggers (raw input + teleport fallback).
 static void TouchSeen(DWORD evt, const char* src) {
+    if (g_userOnTouch) return;                             // user owns touch land right now
     if (evt - g_lastTouchTick > SEQ_GAP_MS) {              // new touch sequence
-        if (g_userOnTouch || OnTouchMon(g_homePos)) {
-            LogF("SEQ skip (%s): user on touch monitor / no valid home", src);
-            return;                                        // don't yank a cursor that lives there
+        if (OnTouchMon(g_homePos)) {
+            LogF("SEQ skip (%s): no valid home", src);
+            return;                                        // nowhere sane to snap to
         }
         g_anchor     = g_homePos;                          // last real off-touch position
         g_haveAnchor = TRUE;
@@ -416,12 +420,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
     if (msg == g_wmTaskbarCreated) { TrayAdd(); return 0; }
 
     switch (msg) {
-    case WM_INPUT:
-        // Touch trigger #1: we only registered digitizer usages, so any
-        // WM_INPUT == touch/pen. GetMessageTime = queue timestamp (immune to
-        // delivery lag under load).
-        if (g_enabled) TouchSeen((DWORD)GetMessageTime(), "rawinput");
+    case WM_INPUT: {
+        // Mouse raw input = "hand on mouse" signal; digitizer raw input = touch
+        // trigger #1. GetMessageTime = queue timestamp (immune to delivery lag).
+        RAWINPUTHEADER hdr; UINT hsz = sizeof(hdr);
+        if (GetRawInputData((HRAWINPUT)l, RID_HEADER, &hdr, &hsz, sizeof(RAWINPUTHEADER)) != (UINT)-1) {
+            if (hdr.dwType == RIM_TYPEMOUSE) {
+                BYTE buf[sizeof(RAWINPUT) + 32]; UINT sz = sizeof(buf);
+                if (GetRawInputData((HRAWINPUT)l, RID_INPUT, buf, &sz, sizeof(RAWINPUTHEADER)) != (UINT)-1) {
+                    const RAWINPUT* ri = reinterpret_cast<const RAWINPUT*>(buf);
+                    if (!(ri->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) &&
+                        (ri->data.mouse.lLastX || ri->data.mouse.lLastY))
+                        g_mouseRawTick = (DWORD)GetMessageTime();   // real relative mouse motion
+                }
+            } else if (g_enabled) {
+                TouchSeen((DWORD)GetMessageTime(), "rawinput");     // digitizer = touch/pen
+            }
+        }
         return DefWindowProcW(hwnd, msg, w, l);            // raw-input cleanup
+    }
 
     case WM_TELEPORT:
         if (g_enabled) TouchSeen(g_tpTime, "teleport");
@@ -551,7 +568,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmd, int) {
         wchar_t* s = wcsrchr(p, L'\\');
         lstrcpyW(s ? s + 1 : p, L"TouchCursorFix.log");
         g_logf = _wfopen(p, L"w");
-        LogF("start (v1.2.5)");
+        LogF("start (v1.3.0)");
     }
 
     // Per-Monitor-V2 DPI awareness: the LL-hook coords and SetCursorPos then share
@@ -593,24 +610,26 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmd, int) {
 
     TrayAdd();
 
-    // Raw input, as an input sink: touch screens (0x0D/0x04), pens (0x02) and pen
-    // digitizers (0x01) - but NOT precision touchpads (0x05).
-    RAWINPUTDEVICE rids[3] = {};
-    static const USHORT usages[3] = { 0x04, 0x02, 0x01 };
-    for (int i = 0; i < 3; ++i) {
-        rids[i].usUsagePage = 0x0D;
+    // Raw input, as an input sink: touch screens (0x0D/0x04), pens (0x02), pen
+    // digitizers (0x01) - NOT precision touchpads (0x05) - plus generic mice
+    // (0x01/0x02) purely as the "hand on mouse" signal.
+    RAWINPUTDEVICE rids[4] = {};
+    static const USHORT pages[4]  = { 0x0D, 0x0D, 0x0D, 0x01 };
+    static const USHORT usages[4] = { 0x04, 0x02, 0x01, 0x02 };
+    for (int i = 0; i < 4; ++i) {
+        rids[i].usUsagePage = pages[i];
         rids[i].usUsage     = usages[i];
         rids[i].dwFlags     = RIDEV_INPUTSINK;
         rids[i].hwndTarget  = g_hwnd;
     }
-    if (!RegisterRawInputDevices(rids, 3, sizeof(rids[0]))) {
-        // Fallback: the whole digitizer page (covers exotic devices).
-        RAWINPUTDEVICE rid = {};
-        rid.usUsagePage = 0x0D;
-        rid.usUsage     = 0;
-        rid.dwFlags     = RIDEV_PAGEONLY | RIDEV_INPUTSINK;
-        rid.hwndTarget  = g_hwnd;
-        if (!RegisterRawInputDevices(&rid, 1, sizeof(rid)))
+    if (!RegisterRawInputDevices(rids, 4, sizeof(rids[0]))) {
+        // Fallback: the whole digitizer page (covers exotic devices) + mice.
+        RAWINPUTDEVICE fb[2] = {};
+        fb[0].usUsagePage = 0x0D; fb[0].usUsage = 0;
+        fb[0].dwFlags = RIDEV_PAGEONLY | RIDEV_INPUTSINK; fb[0].hwndTarget = g_hwnd;
+        fb[1].usUsagePage = 0x01; fb[1].usUsage = 0x02;
+        fb[1].dwFlags = RIDEV_INPUTSINK; fb[1].hwndTarget = g_hwnd;
+        if (!RegisterRawInputDevices(fb, 2, sizeof(fb[0])))
             MessageBoxW(nullptr, L"Could not register for touch (raw input) events.\n"
                                  L"Touch detection will rely on teleport detection only.",
                         APP_NAME, MB_ICONWARNING);
