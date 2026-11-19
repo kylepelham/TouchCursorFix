@@ -55,6 +55,7 @@
 #define IDM_EXIT    103
 #define TIMER_ID     1
 #define TIMER_REHOOK 2
+#define TIMER_DISPLAY_REFRESH 3
 
 #define HIST        256     // cursor-position history (power of two)
 #define POLL_MS     10      // timer cadence while a touch is in progress
@@ -63,6 +64,7 @@
 #define MAX_SEQ_MS  1500    // hard cap on how long one sequence can stay alive
 #define SUPPRESS_MS 400     // ignore foreground changes during/just after a touch
 #define REHOOK_MS   60000   // hook-health watchdog cadence
+#define DISPLAY_REFRESH_MS 5000
 #define SNAP_WIN_MS 3000    // keep re-snapping this long: Windows pins the cursor to the
                             // touch point until the synthesized click is fully delivered,
                             // which takes SECONDS for slow targets (VMware)
@@ -446,6 +448,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
 
     case WM_TIMER:
         if (w == TIMER_REHOOK) { RehookIfDead(); RefreshTouchMonitors(); return 0; }
+        if (w == TIMER_DISPLAY_REFRESH) {
+            if (KillTimer(hwnd, TIMER_DISPLAY_REFRESH)) RefreshTouchMonitors();
+            return 0;
+        }
         if (g_pending && (GetTickCount() - g_lastTouchTick) >= RESTORE_MS) {
             InterlockedExchange(&g_pending, 0);
             // Focus FIRST: a VM/game that grabbed the cursor releases its grab
@@ -516,6 +522,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
 
     case WM_DISPLAYCHANGE:
         RefreshTouchMonitors();
+        // Wireless touch devices can register after the display change arrives.
+        SetTimer(hwnd, TIMER_DISPLAY_REFRESH, DISPLAY_REFRESH_MS, nullptr);
         return 0;
 
     case WM_TRAY:
